@@ -12,11 +12,13 @@ import (
 )
 
 const (
+	SSTableCountThreshold = 3
 	MemtableSizeThreshold = 4096 // 4 KB
 )
 
 type DBState struct {
-	SSTableCounter int `json:"sstable_counter"`
+	NextFileNumber int   `json:"next_file_number"`
+	ActiveSSTables []int `json:"active_sstables"`
 }
 
 type DB struct {
@@ -26,9 +28,12 @@ type DB struct {
 	immutableMem *Memtable
 
 	dataDir        string
-	sstableCounter int
+	nextFileNumber int
+	activeSSTables []int
 
 	sequenceNum atomic.Uint64
+
+	compactionInProgress bool
 }
 
 // NewDB creates or opens a database at the specified path.
@@ -45,7 +50,7 @@ func NewDB(dir string) (*DB, error) {
 	if err != nil {
 		if os.IsNotExist(err) {
 			log.Println("state file does not exist, initializing default state")
-			state = DBState{SSTableCounter: 1}
+			state = DBState{NextFileNumber: 1, ActiveSSTables: []int{}}
 		} else {
 			return nil, err
 		}
@@ -53,7 +58,8 @@ func NewDB(dir string) (*DB, error) {
 		if err := json.Unmarshal(data, &state); err != nil {
 			return nil, err
 		}
-		log.Printf("loaded state: sstable_counter is %d", state.SSTableCounter)
+		log.Printf("loaded state - next file number is %d, active SSTable is %v",
+			state.NextFileNumber, state.ActiveSSTables)
 	}
 
 	mem := NewMemtable()
@@ -96,7 +102,8 @@ func NewDB(dir string) (*DB, error) {
 		wal:            wal,
 		mem:            mem,
 		dataDir:        dir,
-		sstableCounter: state.SSTableCounter,
+		nextFileNumber: state.NextFileNumber,
+		activeSSTables: state.ActiveSSTables,
 	}
 	db.sequenceNum.Store(maxSeqNum)
 	db.saveState()
@@ -106,7 +113,8 @@ func NewDB(dir string) (*DB, error) {
 
 func (db *DB) saveState() error {
 	state := DBState{
-		SSTableCounter: db.sstableCounter,
+		NextFileNumber: db.nextFileNumber,
+		ActiveSSTables: db.activeSSTables,
 	}
 
 	data, err := json.MarshalIndent(state, "", "")
@@ -127,8 +135,10 @@ func (db *DB) flushMemtable() {
 	}
 
 	// WAL rotation
+	sstNum := db.nextFileNumber
+	db.nextFileNumber++
 	walPath := db.wal.file.Name()
-	rotatedWALPath := fmt.Sprintf("%s/wal-%05d.log", db.dataDir, db.sstableCounter)
+	rotatedWALPath := fmt.Sprintf("%s/wal-%05d.log", db.dataDir, sstNum)
 	db.wal.Close()
 
 	if err := os.Rename(walPath, rotatedWALPath); err != nil {
@@ -149,10 +159,9 @@ func (db *DB) flushMemtable() {
 	db.mem = NewMemtable()
 	db.mu.Unlock()
 
-	go func(imm *Memtable, walToDelete string) {
-		log.Printf("background flush: starting to write SSTable...")
-		sstablePath := fmt.Sprintf("%s/%05d.sst", db.dataDir, db.sstableCounter)
-		db.sstableCounter++
+	go func(imm *Memtable, walToDelete string, sstNum int) {
+		log.Printf("background flush: starting to write SSTable %d...", sstNum)
+		sstablePath := fmt.Sprintf("%s/%05d.sst", db.dataDir, sstNum)
 
 		itemCount := imm.data.Len()
 		if err := WriteSSTable(sstablePath, uint(itemCount), imm.data.Front()); err != nil {
@@ -165,6 +174,8 @@ func (db *DB) flushMemtable() {
 		defer db.mu.Unlock()
 
 		db.immutableMem = nil
+		db.activeSSTables = append(db.activeSSTables, sstNum)
+		sort.Ints(db.activeSSTables)
 
 		if err := db.saveState(); err != nil {
 			log.Printf("failed to save state: %v", err)
@@ -177,7 +188,11 @@ func (db *DB) flushMemtable() {
 		} else {
 			log.Printf("background flush: deleted old WAL %s", walToDelete)
 		}
-	}(db.immutableMem, rotatedWALPath)
+
+		if len(db.activeSSTables) >= SSTableCountThreshold && !db.compactionInProgress {
+			go db.compact()
+		}
+	}(db.immutableMem, rotatedWALPath, sstNum)
 }
 
 func (db *DB) Put(key, value []byte) error {
@@ -216,7 +231,7 @@ func (db *DB) Get(key []byte) ([]byte, bool) {
 	db.mu.RLock()
 	mem := db.mem
 	imm := db.immutableMem
-	counter := db.sstableCounter
+	activeTables := db.activeSSTables
 	db.mu.RUnlock()
 
 	val, found := mem.Get(key)
@@ -240,8 +255,9 @@ func (db *DB) Get(key []byte) ([]byte, bool) {
 	}
 
 	// Search key in newest to oldest SSTables
-	for i := counter - 1; i >= 1; i-- {
-		sstablePath := fmt.Sprintf("%s/%05d.sst", db.dataDir, i)
+	for i := len(activeTables) - 1; i >= 0; i-- {
+		sstNum := activeTables[i]
+		sstablePath := fmt.Sprintf("%s/%05d.sst", db.dataDir, sstNum)
 		reader, err := NewSSTableReader(sstablePath)
 		if err != nil {
 			log.Printf("failed to open reader %s: %v", sstablePath, err)

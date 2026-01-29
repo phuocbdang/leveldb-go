@@ -1,5 +1,7 @@
 package main
 
+import "github.com/huandu/skiplist"
+
 // OpType defines the operation type for an empty.
 type OpType byte
 
@@ -43,4 +45,8 @@ func (c internalKeyComparable) Compare(k1, k2 interface{}) int {
 
 func (c internalKeyComparable) CalcScore(key interface{}) float64 {
 	return 0
+}
+
+func NewInternalKeyComparator() skiplist.Comparable {
+	return internalKeyComparable{}
 }

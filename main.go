@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"log"
 	"os"
+	"time"
 )
 
 func main() {
@@ -15,7 +16,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	for i := 0; i < 1000; i++ {
+	for i := 0; i < 10000; i++ {
 		key := fmt.Sprintf("key_%03d", i)
 		value := fmt.Sprintf("value_%03d", i)
 
@@ -36,7 +37,7 @@ func main() {
 	if ok {
 		log.Println(string(val))
 	} else {
-		log.Fatalf("key not found")
+		log.Printf("key not found")
 	}
 
 	keyToFind = []byte("ke_010")
@@ -44,6 +45,8 @@ func main() {
 	if ok {
 		log.Println(string(val))
 	} else {
-		log.Fatalf("key not found")
+		log.Printf("key not found")
 	}
+
+	time.Sleep(15 * time.Second)
 }
