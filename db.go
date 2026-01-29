@@ -9,6 +9,8 @@ import (
 	"sort"
 	"sync"
 	"sync/atomic"
+
+	"github.com/gofrs/flock"
 )
 
 const (
@@ -34,6 +36,8 @@ type DB struct {
 	sequenceNum atomic.Uint64
 
 	compactionInProgress bool
+
+	dbLock *flock.Flock
 }
 
 // NewDB creates or opens a database at the specified path.
@@ -44,6 +48,16 @@ func NewDB(dir string) (*DB, error) {
 		return nil, err
 	}
 
+	lockPath := filepath.Join(dir, "lock")
+	dbLock := flock.New(lockPath)
+	locked, err := dbLock.TryLock()
+	if err != nil {
+		return nil, fmt.Errorf("failed to acquire lock: %w", err)
+	}
+	if !locked {
+		return nil, fmt.Errorf("database is locked by another process")
+	}
+
 	var state DBState
 	statePath := filepath.Join(dir, "state.json")
 	data, err := os.ReadFile(statePath)
@@ -52,6 +66,7 @@ func NewDB(dir string) (*DB, error) {
 			log.Println("state file does not exist, initializing default state")
 			state = DBState{NextFileNumber: 1, ActiveSSTables: []int{}}
 		} else {
+			dbLock.Unlock()
 			return nil, err
 		}
 	} else {
@@ -79,6 +94,7 @@ func NewDB(dir string) (*DB, error) {
 
 		recoveredData, lastSeq, err := Replay(walPath)
 		if err != nil {
+			dbLock.Unlock()
 			return nil, fmt.Errorf("failed to replay WAL %s: %w", walPath, err)
 		}
 
@@ -95,6 +111,7 @@ func NewDB(dir string) (*DB, error) {
 
 	wal, err := NewWAL(activeWAL)
 	if err != nil {
+		dbLock.Unlock()
 		return nil, err
 	}
 
@@ -104,6 +121,7 @@ func NewDB(dir string) (*DB, error) {
 		dataDir:        dir,
 		nextFileNumber: state.NextFileNumber,
 		activeSSTables: state.ActiveSSTables,
+		dbLock:         dbLock,
 	}
 	db.sequenceNum.Store(maxSeqNum)
 	db.saveState()
@@ -314,5 +332,11 @@ func (db *DB) Delete(key []byte) error {
 }
 
 func (db *DB) Close() error {
+	if db.dbLock != nil {
+		if err := db.dbLock.Unlock(); err != nil {
+			log.Printf("failed to unlock database: %v", err)
+		}
+	}
+
 	return db.wal.Close()
 }
