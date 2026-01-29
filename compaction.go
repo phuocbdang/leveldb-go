@@ -240,6 +240,11 @@ func (db *DB) compact() {
 
 	db.compactionInProgress = false
 
+	// Invalidate cache entries for compacted SSTables before deleting files.
+	for _, num := range tablesToCompact {
+		db.tableCache.Remove(num)
+	}
+
 	db.wg.Add(1)
 	go func(pathsToCompact []string) {
 		defer db.wg.Done()

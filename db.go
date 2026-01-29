@@ -11,11 +11,13 @@ import (
 	"sync/atomic"
 
 	"github.com/gofrs/flock"
+	lru "github.com/hashicorp/golang-lru/v2"
 )
 
 const (
 	SSTableCountThreshold = 3
 	MemtableSizeThreshold = 4096 // 4 KB
+	NumTableCacheSize     = 128
 )
 
 type DBState struct {
@@ -41,6 +43,8 @@ type DB struct {
 	compactionInProgress bool
 
 	dbLock *flock.Flock
+
+	tableCache *lru.Cache[int, *SSTableReader]
 }
 
 // NewDB creates or opens a database at the specified path.
@@ -59,6 +63,15 @@ func NewDB(dir string) (*DB, error) {
 	}
 	if !locked {
 		return nil, fmt.Errorf("database is locked by another process")
+	}
+
+	tableCache, err := lru.NewWithEvict[int, *SSTableReader](NumTableCacheSize, func(key int, value *SSTableReader) {
+		// When a reader is evicted from the cache, close its file handle.
+		value.Close()
+	})
+	if err != nil {
+		dbLock.Unlock()
+		return nil, fmt.Errorf("failed to create table cache: %w", err)
 	}
 
 	var state DBState
@@ -125,6 +138,7 @@ func NewDB(dir string) (*DB, error) {
 		nextFileNumber: state.NextFileNumber,
 		activeSSTables: state.ActiveSSTables,
 		dbLock:         dbLock,
+		tableCache:     tableCache,
 	}
 	db.sequenceNum.Store(maxSeqNum)
 	db.saveState()
@@ -145,6 +159,24 @@ func (db *DB) saveState() error {
 
 	statePath := filepath.Join(db.dataDir, "state.json")
 	return os.WriteFile(statePath, data, 0644)
+}
+
+// findTable is a helper to get an SSTableReader, using the cache.
+func (db *DB) findTable(sstNum int) (*SSTableReader, error) {
+	if reader, ok := db.tableCache.Get(sstNum); ok {
+		return reader, nil
+	}
+
+	// Cache miss
+	sstablePath := fmt.Sprintf("%s/%05d.sst", db.dataDir, sstNum)
+	reader, err := NewSSTableReader(sstablePath)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add the new reader to the cache.
+	db.tableCache.Add(sstNum, reader)
+	return reader, nil
 }
 
 func (db *DB) flushMemtable() {
@@ -285,14 +317,13 @@ func (db *DB) Get(key []byte) ([]byte, bool) {
 	for i := len(activeTables) - 1; i >= 0; i-- {
 		sstNum := activeTables[i]
 		sstablePath := fmt.Sprintf("%s/%05d.sst", db.dataDir, sstNum)
-		reader, err := NewSSTableReader(sstablePath)
+		reader, err := db.findTable(sstNum)
 		if err != nil {
 			log.Printf("failed to open reader %s: %v", sstablePath, err)
 			continue
 		}
 
 		val, found, err = reader.Get(key)
-		reader.Close()
 		if err != nil {
 			log.Printf("error reading SSTable %s: %v", sstablePath, err)
 			continue
@@ -360,6 +391,9 @@ func (db *DB) Close() error {
 		log.Printf("failed to close WAL: %v", err)
 		errs = append(errs, fmt.Errorf("failed to close WAL: %w", err))
 	}
+
+	// Purge the table cache to close all cached SSTable file handles.
+	db.tableCache.Purge()
 
 	if err := db.saveState(); err != nil {
 		log.Printf("failed to save final state: %v", err)
