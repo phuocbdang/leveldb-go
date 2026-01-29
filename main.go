@@ -34,7 +34,7 @@ func main() {
 	keyToFind := []byte("key_010")
 	val, ok := db2.Get(keyToFind)
 	if ok {
-		fmt.Println(string(val))
+		log.Println(string(val))
 	} else {
 		log.Fatalf("key not found")
 	}
@@ -42,7 +42,7 @@ func main() {
 	keyToFind = []byte("ke_010")
 	val, ok = db2.Get(keyToFind)
 	if ok {
-		fmt.Println(string(val))
+		log.Println(string(val))
 	} else {
 		log.Fatalf("key not found")
 	}
