@@ -57,6 +57,13 @@ type sstableIterator struct {
 	err    error
 }
 
+func (it *sstableIterator) Close() error {
+	if it.file != nil {
+		return it.file.Close()
+	}
+	return nil
+}
+
 // newSSTableFileIterator creates an iterator that streams from a file path.
 func newSSTableFileIterator(path string) (*sstableIterator, error) {
 	file, err := os.Open(path)
@@ -115,10 +122,21 @@ func MergeSSTables(paths []string, outputPath string) error {
 			if os.IsNotExist(err) {
 				continue
 			}
+			// Close any already opened iterators before returning
+			for _, openIt := range iterators {
+				openIt.Close()
+			}
 			return err
 		}
 		iterators = append(iterators, it)
 	}
+
+	// Ensure all iterators are closed when done
+	defer func() {
+		for _, it := range iterators {
+			it.Close()
+		}
+	}()
 
 	h := &minHeap{}
 	heap.Init(h)
@@ -166,6 +184,7 @@ func MergeSSTables(paths []string, outputPath string) error {
 }
 
 func (db *DB) compact() {
+	defer db.wg.Done()
 	log.Println("starting compaction...")
 
 	db.mu.Lock()
@@ -218,13 +237,16 @@ func (db *DB) compact() {
 	}
 
 	log.Printf("compaction completed successfully to %s", newSSTablePath)
+
+	db.compactionInProgress = false
+
+	db.wg.Add(1)
 	go func(pathsToCompact []string) {
+		defer db.wg.Done()
 		for _, path := range pathsToCompact {
 			if err := os.Remove(path); err != nil {
 				log.Printf("failed to remove old SSTable %s after compaction: %v", path, err)
 			}
 		}
 	}(pathsToCompact)
-
-	db.compactionInProgress = false
 }

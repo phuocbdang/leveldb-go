@@ -47,6 +47,9 @@ func (w *WAL) Close() error {
 	w.mu.Lock()
 	defer w.mu.Unlock()
 
+	if err := w.bw.Flush(); err != nil {
+		return err
+	}
 	return w.file.Close()
 }
 

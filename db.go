@@ -29,6 +29,9 @@ type DB struct {
 	mem          *Memtable
 	immutableMem *Memtable
 
+	closing atomic.Bool
+	wg      sync.WaitGroup
+
 	dataDir        string
 	nextFileNumber int
 	activeSSTables []int
@@ -177,7 +180,9 @@ func (db *DB) flushMemtable() {
 	db.mem = NewMemtable()
 	db.mu.Unlock()
 
+	db.wg.Add(1)
 	go func(imm *Memtable, walToDelete string, sstNum int) {
+		defer db.wg.Done()
 		log.Printf("background flush: starting to write SSTable %d...", sstNum)
 		sstablePath := fmt.Sprintf("%s/%05d.sst", db.dataDir, sstNum)
 
@@ -207,13 +212,17 @@ func (db *DB) flushMemtable() {
 			log.Printf("background flush: deleted old WAL %s", walToDelete)
 		}
 
-		if len(db.activeSSTables) >= SSTableCountThreshold && !db.compactionInProgress {
+		if len(db.activeSSTables) >= SSTableCountThreshold && !db.compactionInProgress && !db.closing.Load() {
+			db.wg.Add(1)
 			go db.compact()
 		}
 	}(db.immutableMem, rotatedWALPath, sstNum)
 }
 
 func (db *DB) Put(key, value []byte) error {
+	if db.closing.Load() {
+		return fmt.Errorf("database is closed")
+	}
 	seqNum := db.sequenceNum.Add(1)
 	internalKey := InternalKey{
 		UserKey: string(key),
@@ -283,6 +292,7 @@ func (db *DB) Get(key []byte) ([]byte, bool) {
 		}
 
 		val, found, err = reader.Get(key)
+		reader.Close()
 		if err != nil {
 			log.Printf("error reading SSTable %s: %v", sstablePath, err)
 			continue
@@ -294,14 +304,15 @@ func (db *DB) Get(key []byte) ([]byte, bool) {
 			}
 			return val, true
 		}
-
-		reader.Close()
 	}
 
 	return nil, false
 }
 
 func (db *DB) Delete(key []byte) error {
+	if db.closing.Load() {
+		return fmt.Errorf("database is closed")
+	}
 	seqNum := db.sequenceNum.Add(1)
 	internalKey := InternalKey{
 		UserKey: string(key),
@@ -332,11 +343,40 @@ func (db *DB) Delete(key []byte) error {
 }
 
 func (db *DB) Close() error {
+	if db.closing.Swap(true) {
+		return nil // Already closing
+	}
+
+	log.Println("closing database, waiting for background operations...")
+	db.wg.Wait()
+	log.Println("background operations completed")
+
+	db.mu.Lock()
+	defer db.mu.Unlock()
+
+	var errs []error
+
+	if err := db.wal.Close(); err != nil {
+		log.Printf("failed to close WAL: %v", err)
+		errs = append(errs, fmt.Errorf("failed to close WAL: %w", err))
+	}
+
+	if err := db.saveState(); err != nil {
+		log.Printf("failed to save final state: %v", err)
+		errs = append(errs, fmt.Errorf("failed to save final state: %w", err))
+	}
+
 	if db.dbLock != nil {
 		if err := db.dbLock.Unlock(); err != nil {
 			log.Printf("failed to unlock database: %v", err)
+			errs = append(errs, fmt.Errorf("failed to unlock database: %w", err))
 		}
 	}
 
-	return db.wal.Close()
+	log.Println("database closed")
+
+	if len(errs) > 0 {
+		return fmt.Errorf("errors during close: %v", errs)
+	}
+	return nil
 }
