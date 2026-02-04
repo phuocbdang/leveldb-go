@@ -9,9 +9,12 @@ import (
 	"io"
 	"math"
 	"os"
+	"path/filepath"
 	"sort"
+	"strconv"
 
 	"github.com/bits-and-blooms/bloom/v3"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/huandu/skiplist"
 )
 
@@ -37,10 +40,12 @@ type Footer struct {
 }
 
 type SSTableReader struct {
-	file   *os.File
-	index  []IndexEntry
-	filter *bloom.BloomFilter
-	cmp    internalKeyComparable
+	file       *os.File
+	index      []IndexEntry
+	filter     *bloom.BloomFilter
+	cmp        internalKeyComparable
+	blockCache *lru.Cache[string, []byte]
+	fileNum    int
 }
 
 func WriteSSTable(path string, itemCount uint, it *skiplist.Element) error {
@@ -163,7 +168,7 @@ func WriteSSTable(path string, itemCount uint, it *skiplist.Element) error {
 	return file.Sync()
 }
 
-func NewSSTableReader(path string) (*SSTableReader, error) {
+func NewSSTableReader(path string, blockCache *lru.Cache[string, []byte]) (*SSTableReader, error) {
 	file, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -214,12 +219,37 @@ func NewSSTableReader(path string) (*SSTableReader, error) {
 		return nil, fmt.Errorf("failed to decode index: %w", err)
 	}
 
+	base := filepath.Base(path)
+	ext := filepath.Ext(base)
+	numStr := base[:len(base)-len(ext)]
+	fileNum, _ := strconv.Atoi(numStr)
+
 	return &SSTableReader{
-		file:   file,
-		index:  index,
-		filter: filter,
-		cmp:    internalKeyComparable{},
+		file:       file,
+		index:      index,
+		filter:     filter,
+		cmp:        internalKeyComparable{},
+		blockCache: blockCache,
+		fileNum:    fileNum,
 	}, nil
+}
+
+// getBlocks reads a data from disk or retrieves it from the cache.
+func (r *SSTableReader) getBlock(entry IndexEntry) ([]byte, error) {
+	cacheKey := fmt.Sprintf("%d:%d", r.fileNum, entry.Offset)
+	if blockData, ok := r.blockCache.Get(cacheKey); ok {
+		return blockData, nil
+	}
+
+	blockData := make([]byte, entry.Size)
+	_, err := r.file.ReadAt(blockData, entry.Offset)
+	if err != nil {
+		return nil, err
+	}
+
+	r.blockCache.Add(cacheKey, blockData)
+
+	return blockData, nil
 }
 
 func (r *SSTableReader) Get(userKey []byte) ([]byte, bool, error) {
@@ -243,8 +273,7 @@ func (r *SSTableReader) Get(userKey []byte) ([]byte, bool, error) {
 	}
 
 	entry := r.index[blockIndex]
-	blockData := make([]byte, entry.Size)
-	_, err := r.file.ReadAt(blockData, entry.Offset)
+	blockData, err := r.getBlock(entry)
 	if err != nil {
 		return nil, false, err
 	}

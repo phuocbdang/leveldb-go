@@ -16,8 +16,9 @@ import (
 
 const (
 	SSTableCountThreshold = 3
-	MemtableSizeThreshold = 4096 // 4 KB
+	MemtableSizeThreshold = 4 * 1024 * 1024 // 4 MB
 	NumTableCacheSize     = 128
+	BlockCacheSize        = 8 * 1024 * 1024 // 8MB block cache
 )
 
 type DBState struct {
@@ -45,6 +46,7 @@ type DB struct {
 	dbLock *flock.Flock
 
 	tableCache *lru.Cache[int, *SSTableReader]
+	blockCache *lru.Cache[string, []byte]
 }
 
 // NewDB creates or opens a database at the specified path.
@@ -72,6 +74,12 @@ func NewDB(dir string) (*DB, error) {
 	if err != nil {
 		dbLock.Unlock()
 		return nil, fmt.Errorf("failed to create table cache: %w", err)
+	}
+
+	blockCache, err := lru.New[string, []byte](BlockCacheSize / DataBlockSize)
+	if err != nil {
+		dbLock.Unlock()
+		return nil, fmt.Errorf("failed to create block cache: %w", err)
 	}
 
 	var state DBState
@@ -139,6 +147,7 @@ func NewDB(dir string) (*DB, error) {
 		activeSSTables: state.ActiveSSTables,
 		dbLock:         dbLock,
 		tableCache:     tableCache,
+		blockCache:     blockCache,
 	}
 	db.sequenceNum.Store(maxSeqNum)
 	db.saveState()
@@ -169,7 +178,7 @@ func (db *DB) findTable(sstNum int) (*SSTableReader, error) {
 
 	// Cache miss
 	sstablePath := fmt.Sprintf("%s/%05d.sst", db.dataDir, sstNum)
-	reader, err := NewSSTableReader(sstablePath)
+	reader, err := NewSSTableReader(sstablePath, db.blockCache)
 	if err != nil {
 		return nil, err
 	}

@@ -3,19 +3,20 @@ package main
 import (
 	"fmt"
 	"log"
+	"os"
 	"time"
 )
 
 func main() {
 	dbDir := "db"
-	//os.RemoveAll(dbDir)
+	os.RemoveAll(dbDir)
 
 	db, err := NewDB(dbDir)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	for i := 0; i < 10000; i++ {
+	for i := range 10000 {
 		key := fmt.Sprintf("key_%03d", i)
 		value := fmt.Sprintf("value_%03d", i)
 
