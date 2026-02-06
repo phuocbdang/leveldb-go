@@ -1,10 +1,8 @@
 package main
 
 import (
-	"fmt"
 	"log"
 	"os"
-	"time"
 )
 
 func main() {
@@ -13,40 +11,45 @@ func main() {
 
 	db, err := NewDB(dbDir)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatalf("failed to create DB: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Put([]byte("apple"), []byte("red")); err != nil {
+		log.Fatalf("put failed: %v", err)
+	}
+	if err := db.Put([]byte("banana"), []byte("yellow")); err != nil {
+		log.Fatalf("put failed: %v", err)
+	}
+	if err := db.Put([]byte("cherry"), []byte("red")); err != nil {
+		log.Fatalf("put failed: %v", err)
+	}
+	if err := db.Put([]byte("apple"), []byte("green")); err != nil {
+		log.Fatalf("put failed: %v", err)
+	}
+	if err := db.Delete([]byte("banana")); err != nil {
+		log.Fatalf("delete failed: %v", err)
 	}
 
-	for i := range 10000 {
-		key := fmt.Sprintf("key_%03d", i)
-		value := fmt.Sprintf("value_%03d", i)
+	iter := db.NewIterator()
+	defer iter.Close()
 
-		if err := db.Put([]byte(key), []byte(value)); err != nil {
-			log.Fatal(err)
-		}
+	// Seek to the first key and iterate
+	count := 0
+	for iter.SeekToFirst(); iter.Valid(); iter.Next() {
+		key := iter.Key()
+		value := iter.Value()
+		log.Printf("key: %s, value: %s\n", key.UserKey, string(value))
+		count++
 	}
 
-	db.Close()
-
-	db2, err := NewDB(dbDir)
-	if err != nil {
-		log.Fatal("failed to reopen db")
+	// Check for any errors during iteration
+	if err := iter.Error(); err != nil {
+		log.Fatalf("iterator failed with error: %v", err)
 	}
 
-	keyToFind := []byte("key_010")
-	val, ok := db2.Get(keyToFind)
-	if ok {
-		log.Println(string(val))
-	} else {
-		log.Printf("key not found")
+	// Verification
+	if count != 2 {
+		log.Fatalf("expected to find 2 live keys, but found %d.", count)
 	}
-
-	keyToFind = []byte("ke_010")
-	val, ok = db2.Get(keyToFind)
-	if ok {
-		log.Println(string(val))
-	} else {
-		log.Printf("key not found")
-	}
-
-	time.Sleep(15 * time.Second)
 }

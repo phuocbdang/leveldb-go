@@ -79,7 +79,6 @@ func newSSTableFileIterator(path string) (*sstableIterator, error) {
 
 func (it *sstableIterator) Next() bool {
 	var keySize uint32
-
 	if err := binary.Read(it.reader, binary.LittleEndian, &keySize); err != nil {
 		if err != io.EOF {
 			it.err = err
